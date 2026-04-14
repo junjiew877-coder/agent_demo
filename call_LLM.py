@@ -7,6 +7,8 @@ from typing import List, Dict, Optional, Tuple
 # 加载 .env 文件中的环境变量
 load_dotenv()
 
+from react_log import trace_line
+
 
 def _env_model_chat() -> str:
     return (
@@ -90,17 +92,17 @@ def _print_reasoning_box(reasoning_text: str) -> None:
             continue
         body_rows.extend(_wrap_to_display_width(para, inner))
 
-    print(f"\n┏{'═' * bar_len}┓")
+    trace_line(f"\n┏{'═' * bar_len}┓")
     for t in _wrap_to_display_width(title_top, inner):
-        print("┃ " + _pad_to_display_width(t, inner) + " ┃")
-    print(f"┣{'─' * bar_len}┫")
+        trace_line("┃ " + _pad_to_display_width(t, inner) + " ┃")
+    trace_line(f"┣{'─' * bar_len}┫")
     for row in body_rows:
         for seg in _wrap_to_display_width(row, inner):
-            print("┃ " + _pad_to_display_width(seg, inner) + " ┃")
-    print(f"┣{'─' * bar_len}┫")
+            trace_line("┃ " + _pad_to_display_width(seg, inner) + " ┃")
+    trace_line(f"┣{'─' * bar_len}┫")
     for t in _wrap_to_display_width(title_bot, inner):
-        print("┃ " + _pad_to_display_width(t, inner) + " ┃")
-    print(f"┗{'═' * bar_len}┛\n")
+        trace_line("┃ " + _pad_to_display_width(t, inner) + " ┃")
+    trace_line(f"┗{'═' * bar_len}┛\n")
 
 
 class HelloAgentsLLM:
@@ -168,7 +170,7 @@ class HelloAgentsLLM:
         思考模型（deepseek-reasoner）流式返回 reasoning_content 与 content；
         ReAct 解析仅使用 content（正式回复），链式思考可选打印。
         """
-        print(f"🧠 正在调用 {self.model} 模型...")
+        trace_line(f"🧠 正在调用 {self.model} 模型...")
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -194,7 +196,7 @@ class HelloAgentsLLM:
             reasoning_text = "".join(reasoning_parts)
             content_text = "".join(collected_content)
 
-            print("✅ 大语言模型响应成功")
+            trace_line("✅ 大语言模型响应成功")
 
             if self.use_reasoner and reasoning_text and show_chain:
                 _print_reasoning_box(reasoning_text)
@@ -204,7 +206,7 @@ class HelloAgentsLLM:
             return out if out else None
 
         except Exception as e:
-            print(f"❌ 调用LLM API时发生错误: {e}")
+            trace_line(f"❌ 调用LLM API时发生错误: {e}")
             return None
 
 # --- 客户端使用示例 ---

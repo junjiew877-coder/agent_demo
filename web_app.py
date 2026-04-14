@@ -37,7 +37,9 @@ INDEX_HTML = """<!DOCTYPE html>
     h1 { font-size: 1.25rem; }
     textarea { width: 100%; min-height: 6rem; padding: 0.5rem; box-sizing: border-box; }
     button { margin-top: 0.5rem; padding: 0.4rem 1rem; cursor: pointer; }
-    #out { margin-top: 1rem; white-space: pre-wrap; border: 1px solid #ccc; padding: 1rem; border-radius: 6px; min-height: 4rem; background: #fafafa; }
+    #answer { margin-top: 1rem; padding: 0.75rem 1rem; border-radius: 6px; background: #eef6ff; border: 1px solid #aac; }
+    #trace { margin-top: 1rem; white-space: pre-wrap; font-family: ui-monospace, monospace; font-size: 0.82rem; line-height: 1.45; border: 1px solid #ccc; padding: 1rem; border-radius: 6px; max-height: 70vh; overflow: auto; background: #fafafa; }
+    h2 { font-size: 1rem; margin-top: 1.25rem; margin-bottom: 0.35rem; }
     .err { color: #b00020; }
     .meta { font-size: 0.85rem; color: #555; margin-top: 1rem; }
   </style>
@@ -50,16 +52,30 @@ INDEX_HTML = """<!DOCTYPE html>
     <button type="button" id="send">发送</button>
     <button type="button" id="clear">清空会话</button>
   </div>
-  <div id="out"></div>
-  <p class="meta">API: <code>POST /api/chat</code> JSON <code>{"message":"..."}</code> · <code>POST /api/clear</code></p>
+  <div id="status"></div>
+  <h2>最终答复</h2>
+  <div id="answer"></div>
+  <h2>ReAct 过程（与终端一致）</h2>
+  <pre id="trace"></pre>
+  <p class="meta">API: <code>POST /api/chat</code> 返回 <code>answer</code> + <code>trace</code> · <code>POST /api/clear</code></p>
   <script>
-    const out = document.getElementById('out');
+    const status = document.getElementById('status');
+    const answer = document.getElementById('answer');
+    const trace = document.getElementById('trace');
     const q = document.getElementById('q');
+    function setErr(msg) {
+      status.textContent = msg;
+      status.className = 'err';
+      answer.textContent = '';
+      trace.textContent = '';
+    }
     document.getElementById('send').onclick = async () => {
       const message = q.value.trim();
-      if (!message) { out.textContent = '请输入问题。'; out.className = 'err'; return; }
-      out.textContent = '处理中…';
-      out.className = '';
+      if (!message) { setErr('请输入问题。'); return; }
+      status.textContent = '处理中…';
+      status.className = '';
+      answer.textContent = '';
+      trace.textContent = '';
       try {
         const r = await fetch('/api/chat', {
           method: 'POST',
@@ -67,12 +83,18 @@ INDEX_HTML = """<!DOCTYPE html>
           body: JSON.stringify({ message })
         });
         const data = await r.json();
-        if (!r.ok) throw new Error(data.detail || r.statusText);
-        out.textContent = data.answer || '(空)';
-        if (data.ok === false) out.className = 'err';
+        if (!r.ok) {
+          const d = data.detail;
+          const msg = typeof d === 'string' ? d : (Array.isArray(d) ? d.map(x => x.msg || x).join('; ') : r.statusText);
+          throw new Error(msg);
+        }
+        status.textContent = data.ok ? '完成' : '已结束（未得到 Finish）';
+        status.className = data.ok ? '' : 'err';
+        answer.textContent = data.answer || '(空)';
+        trace.textContent = data.trace || '(无过程日志)';
+        if (data.ok === false) answer.className = 'err'; else answer.className = '';
       } catch (e) {
-        out.textContent = '请求失败: ' + e.message;
-        out.className = 'err';
+        setErr('请求失败: ' + e.message);
       }
     };
     document.getElementById('clear').onclick = async () => {
@@ -80,11 +102,12 @@ INDEX_HTML = """<!DOCTYPE html>
         const r = await fetch('/api/clear', { method: 'POST' });
         const data = await r.json();
         if (!r.ok) throw new Error(data.detail || r.statusText);
-        out.textContent = '已清空服务端会话记忆。';
-        out.className = '';
+        status.textContent = '已清空服务端会话记忆。';
+        status.className = '';
+        answer.textContent = '';
+        trace.textContent = '';
       } catch (e) {
-        out.textContent = '清空失败: ' + e.message;
-        out.className = 'err';
+        setErr('清空失败: ' + e.message);
       }
     };
   </script>
@@ -97,7 +120,9 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
+    """answer 为最终答复；trace 为整轮 ReAct 与 LLM/工具日志（与终端一致）。"""
     answer: str
+    trace: str = ""
     ok: bool = True
 
 
@@ -129,13 +154,16 @@ def api_chat(req: ChatRequest) -> ChatResponse:
     text = req.message.strip()
     if not text:
         raise HTTPException(status_code=400, detail="message 不能为空")
-    result = _get_agent().run(text)
+    agent = _get_agent()
+    result = agent.run(text)
+    trace_text = "\n".join(agent.last_run_trace)
     if result is None:
         return ChatResponse(
-            answer="本次未得到 Finish 最终答案（可能达到最大步数或中途失败）。可查看运行终端日志。",
+            answer="本次未得到 Finish 最终答案（可能达到最大步数或中途失败）。过程见下方 trace。",
+            trace=trace_text,
             ok=False,
         )
-    return ChatResponse(answer=result, ok=True)
+    return ChatResponse(answer=result, trace=trace_text, ok=True)
 
 
 @app.post("/api/clear")

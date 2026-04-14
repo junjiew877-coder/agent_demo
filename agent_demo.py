@@ -7,6 +7,7 @@ from tool import ToolExecutor, search, get_current_time
 import re
 import sys
 from prompt import REACT_PROMPT_TEMPLATE
+from react_log import begin_trace_capture, end_trace_capture, trace_line
 
 _EXIT_CMDS = frozenset({"/exit", "/quit", "exit", "quit", ":q", "/q"})
 _HELP_CMDS = frozenset({"/help", "/?", "help"})
@@ -54,6 +55,8 @@ class ReActAgent:
         self.history: List[str] = []
         # 跨用户输入保留，直至 /clear
         self.session_memory: List[str] = []
+        # 最近一轮 run() 的完整终端式日志（供 Web 展示）
+        self.last_run_trace: List[str] = []
 
     def clear_session(self) -> None:
         """清空多轮会话记忆（不重置工具与模型配置）。"""
@@ -88,11 +91,13 @@ class ReActAgent:
         self.history = []
         outcome: Optional[str] = None
         current_step = 0
+        self.last_run_trace = []
+        cap_token = begin_trace_capture(self.last_run_trace)
 
         try:
             while current_step < self.max_steps:
                 current_step += 1
-                print(f"\n--- 第 {current_step} 步 ---")
+                trace_line(f"\n--- 第 {current_step} 步 ---")
 
                 tools_desc = self.tool_executor.getAvailableTools()
                 history_str = self._format_history_for_prompt()
@@ -103,19 +108,19 @@ class ReActAgent:
                 messages = [{"role": "user", "content": prompt}]
                 response_text = self.llm_client.think(messages=messages)
                 if not response_text:
-                    print("错误：LLM未能返回有效响应。")
+                    trace_line("错误：LLM未能返回有效响应。")
                     break
 
                 thought, action = self._parse_output(response_text)
                 if thought:
-                    print(f"🤔 LLM输出：{thought}")
+                    trace_line(f"🤔 LLM输出：{thought}")
                 if not action:
-                    print("警告：未能解析出有效的Action，流程终止。")
+                    trace_line("警告：未能解析出有效的Action，流程终止。")
                     break
 
                 if action.lstrip().lower().startswith("finish"):
                     final_answer = self._parse_action_input(action)
-                    print(f"🎉 最终答案: {final_answer}")
+                    trace_line(f"🎉 最终答案: {final_answer}")
                     outcome = final_answer
                     return outcome
 
@@ -124,7 +129,7 @@ class ReActAgent:
                     self.history.append("Observation: 无效的Action格式，请检查。")
                     continue
 
-                print(f"🎬 行动: {tool_name}[{tool_input}]")
+                trace_line(f"🎬 行动: {tool_name}[{tool_input}]")
                 tool_function = self.tool_executor.getTool(tool_name)
                 observation = (
                     tool_function(tool_input)
@@ -132,16 +137,19 @@ class ReActAgent:
                     else f"错误：未找到名为 '{tool_name}' 的工具。"
                 )
 
-                print(f"👀 观察: {observation}")
+                trace_line(f"👀 观察: {observation}")
                 # 只写入规范化后的 Action，避免把模型多写的伪 Observation/第二 Action 带进 History
                 canonical = f"{tool_name}[{tool_input}]"
                 self.history.append(f"Action: {canonical}")
                 self.history.append(f"Observation: {observation}")
 
-            print("已达到最大步数，流程终止。")
+            trace_line("已达到最大步数，流程终止。")
             return None
         finally:
-            self._append_session_turn(question, outcome, list(self.history))
+            try:
+                self._append_session_turn(question, outcome, list(self.history))
+            finally:
+                end_trace_capture(cap_token)
 
     def _parse_output(self, text: str) -> Tuple[Optional[str], Optional[str]]:
         """
