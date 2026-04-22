@@ -1,0 +1,10 @@
+依赖: pip install -r requirements.txt（在 agent_demo 目录）
+
+启动示例（仓库根目录 xr-rayclaw，便于 import agent_demo）:
+  python -m uvicorn web_app:app --host 0.0.0.0 --port 8000
+
+浏览器: http://127.0.0.1:8000/
+
+可通过环境变量设置模型:
+  AGENT_USE_REASONER=1  使用思考模型；默认 0 为对话模型
+也可以直接在web ui右上角输入模型deepseek-reasoner或deepseek-chat,支持热更新。
