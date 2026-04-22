@@ -1,13 +1,23 @@
 import os
 import unicodedata
+from dataclasses import dataclass
 from openai import OpenAI
 from dotenv import load_dotenv
-from typing import List, Dict, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 # 加载 .env 文件中的环境变量
 load_dotenv()
 
 from react_log import trace_line
+
+
+@dataclass
+class LLMTurnResult:
+    """一轮 chat.completions（含 tools）流式结束后的聚合结果。"""
+
+    content: Optional[str]
+    tool_calls: Optional[List[Dict[str, Any]]]
+    reasoning_content: Optional[str] = None
 
 
 def _env_model_chat() -> str:
@@ -163,6 +173,192 @@ class HelloAgentsLLM:
             raise ValueError(
                 f"未知的模型档: {profile!r}，请使用 chat 或 reasoner。"
             )
+
+    def complete_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        temperature: float = 0,
+    ) -> Optional[LLMTurnResult]:
+        """
+        使用 OpenAI 兼容 Chat Completions 的 tools + tool_choice=auto，流式聚合
+        content / reasoning_content / tool_calls。
+        """
+        trace_line(f"🧠 正在调用 {self.model} 模型（tools）...")
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=temperature,
+                stream=True,
+            )
+
+            show_chain = os.getenv("LLM_SHOW_CHAIN_THOUGHT", "1").strip().lower() not in (
+                "0",
+                "false",
+                "no",
+                "off",
+            )
+            reasoning_parts: List[str] = []
+            reasoning_alt: List[str] = []
+            collected_content: List[str] = []
+            tool_call_rows: List[Dict[str, str]] = []
+
+            for chunk in response:
+                delta = chunk.choices[0].delta
+                rc = getattr(delta, "reasoning_content", None)
+                if rc:
+                    reasoning_parts.append(rc)
+                r2 = getattr(delta, "reasoning", None)
+                if r2:
+                    reasoning_alt.append(r2)
+                content = delta.content or ""
+                collected_content.append(content)
+
+                if delta.tool_calls:
+                    for tool_delta in delta.tool_calls:
+                        idx = tool_delta.index
+                        while len(tool_call_rows) <= idx:
+                            tool_call_rows.append({"id": "", "name": "", "arguments": ""})
+                        if tool_delta.id:
+                            tool_call_rows[idx]["id"] = tool_delta.id
+                        fn = tool_delta.function
+                        if fn is not None:
+                            if fn.name:
+                                tool_call_rows[idx]["name"] = fn.name
+                            if fn.arguments:
+                                tool_call_rows[idx]["arguments"] += fn.arguments
+
+            reasoning_text = "".join(reasoning_parts) or "".join(reasoning_alt)
+            content_text = "".join(collected_content)
+
+            trace_line("✅ 大语言模型响应成功")
+
+            if self.use_reasoner and reasoning_text and show_chain:
+                _print_reasoning_box(reasoning_text)
+
+            normalized_calls: Optional[List[Dict[str, Any]]] = None
+            if tool_call_rows and any(row.get("name") for row in tool_call_rows):
+                normalized_calls = [
+                    {
+                        "id": row["id"],
+                        "type": "function",
+                        "function": {
+                            "name": row["name"],
+                            "arguments": row["arguments"] or "{}",
+                        },
+                    }
+                    for row in tool_call_rows
+                    if row.get("name")
+                ]
+                if not normalized_calls:
+                    normalized_calls = None
+
+            out_content = content_text if content_text.strip() else None
+            return LLMTurnResult(
+                content=out_content,
+                tool_calls=normalized_calls,
+                reasoning_content=reasoning_text or None,
+            )
+
+        except Exception as e:
+            trace_line(f"❌ 调用LLM API时发生错误: {e}")
+            return None
+
+    def stream_complete_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        temperature: float = 0,
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        流式调用 tools API：依次 yield
+        {"kind": "reasoning", "text": 增量}、{"kind": "delta", "text": 增量}，
+        最后 yield {"kind": "complete", "result": LLMTurnResult | None}。
+        供 Web SSE 使用；不在此打印终端思考框。
+        """
+        trace_line(f"🧠 正在调用 {self.model} 模型（tools，流式）...")
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=temperature,
+                stream=True,
+            )
+
+            reasoning_parts: List[str] = []
+            reasoning_alt: List[str] = []
+            collected_content: List[str] = []
+            tool_call_rows: List[Dict[str, str]] = []
+
+            for chunk in response:
+                delta = chunk.choices[0].delta
+                rc = getattr(delta, "reasoning_content", None)
+                if rc:
+                    reasoning_parts.append(rc)
+                    yield {"kind": "reasoning", "text": rc}
+                r2 = getattr(delta, "reasoning", None)
+                if r2:
+                    reasoning_alt.append(r2)
+                    yield {"kind": "reasoning", "text": r2}
+                content = delta.content or ""
+                if content:
+                    collected_content.append(content)
+                    yield {"kind": "delta", "text": content}
+
+                if delta.tool_calls:
+                    for tool_delta in delta.tool_calls:
+                        idx = tool_delta.index
+                        while len(tool_call_rows) <= idx:
+                            tool_call_rows.append({"id": "", "name": "", "arguments": ""})
+                        if tool_delta.id:
+                            tool_call_rows[idx]["id"] = tool_delta.id
+                        fn = tool_delta.function
+                        if fn is not None:
+                            if fn.name:
+                                tool_call_rows[idx]["name"] = fn.name
+                            if fn.arguments:
+                                tool_call_rows[idx]["arguments"] += fn.arguments
+
+            reasoning_text = "".join(reasoning_parts) or "".join(reasoning_alt)
+            content_text = "".join(collected_content)
+
+            trace_line("✅ 大语言模型响应成功")
+
+            normalized_calls: Optional[List[Dict[str, Any]]] = None
+            if tool_call_rows and any(row.get("name") for row in tool_call_rows):
+                normalized_calls = [
+                    {
+                        "id": row["id"],
+                        "type": "function",
+                        "function": {
+                            "name": row["name"],
+                            "arguments": row["arguments"] or "{}",
+                        },
+                    }
+                    for row in tool_call_rows
+                    if row.get("name")
+                ]
+                if not normalized_calls:
+                    normalized_calls = None
+
+            out_content = content_text if content_text.strip() else None
+            yield {
+                "kind": "complete",
+                "result": LLMTurnResult(
+                    content=out_content,
+                    tool_calls=normalized_calls,
+                    reasoning_content=reasoning_text or None,
+                ),
+            }
+
+        except Exception as e:
+            trace_line(f"❌ 调用LLM API时发生错误: {e}")
+            yield {"kind": "complete", "result": None}
 
     def think(self, messages: List[Dict[str, str]], temperature: float = 0) -> Optional[str]:
         """

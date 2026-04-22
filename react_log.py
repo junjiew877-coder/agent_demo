@@ -24,4 +24,13 @@ def begin_trace_capture(lines: List[str]) -> Token:
 
 
 def end_trace_capture(token: Token) -> None:
-    _TRACE_LINES.reset(token)
+    """
+    与 begin_trace_capture 成对使用。注意：在 FastAPI StreamingResponse(SSE) 中，
+    生成器在 yield 之后可能处于与 set() 时不同的 Context，reset(token) 会抛
+    ValueError: ... was created in a different Context。此时直接清空绑定即可；
+    日志已写入传入的 list 对象，不受影响。
+    """
+    try:
+        _TRACE_LINES.reset(token)
+    except ValueError:
+        _TRACE_LINES.set(None)

@@ -1,216 +1,240 @@
 import argparse
 import os
-from typing import List, Optional, Tuple
+import sys
+from typing import Any, Dict, List, Optional
 
 from call_LLM import HelloAgentsLLM, get_default_model_ids
-from tool import ToolExecutor, search, get_current_time
-import re
-import sys
-from prompt import REACT_PROMPT_TEMPLATE
+from tool.executor import ToolExecutor
+from tool.search import search
+from tool.current_time import get_current_time
+from prompt import TOOL_AGENT_SYSTEM_PROMPT
 from react_log import begin_trace_capture, end_trace_capture, trace_line
 
 _EXIT_CMDS = frozenset({"/exit", "/quit", "exit", "quit", ":q", "/q"})
 _HELP_CMDS = frozenset({"/help", "/?", "help"})
 _CLEAR_CMDS = frozenset({"/clear", "/reset"})
 
-# 使用 deepseek-reasoner 时，单轮问答内 LLM 的最大调用步数（与 ReAct 循环一致）
 REASONER_AGENT_MAX_STEPS = 10
 CHAT_AGENT_MAX_STEPS = int(os.getenv("LLM_CHAT_AGENT_MAX_STEPS", "10"))
+
+TOOL_PREVIEW_MAX = 400
 
 
 def _agent_max_steps_for_llm(llm: HelloAgentsLLM) -> int:
     return REASONER_AGENT_MAX_STEPS if llm.use_reasoner else CHAT_AGENT_MAX_STEPS
 
 
-def _parse_tool_call_line(action_line: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    解析单行工具调用：ToolName[...] 或 Finish[...]。
-    使用括号深度匹配第一个 [...]，避免贪婪正则吞到文末最后一个 ]。
-    """
-    s = (action_line or "").strip()
-    m = re.match(r"^(\w+)\[", s)
-    if not m:
-        return None, None
-    name = m.group(1)
-    i = m.end()
-    depth = 1
-    start = i
-    while i < len(s):
-        c = s[i]
-        if c == "[":
-            depth += 1
-        elif c == "]":
-            depth -= 1
-            if depth == 0:
-                return name, s[start:i]
-        i += 1
-    return None, None
-
-
 class ReActAgent:
+    """
+    使用 OpenAI 兼容 Chat Completions 的 tool calling（tool_choice=auto）与多轮消息。
+    会话记忆为不含 system 的 OpenAI 风格 message 列表。
+    """
+
     def __init__(self, llm_client: HelloAgentsLLM, tool_executor: ToolExecutor, max_steps: int = 10):
         self.llm_client = llm_client
         self.tool_executor = tool_executor
         self.max_steps = max_steps
-        self.history: List[str] = []
-        # 跨用户输入保留，直至 /clear
-        self.session_memory: List[str] = []
-        # 最近一轮 run() 的完整终端式日志（供 Web 展示）
+        self.session_memory: List[Dict[str, Any]] = []
         self.last_run_trace: List[str] = []
 
     def clear_session(self) -> None:
-        """清空多轮会话记忆（不重置工具与模型配置）。"""
         self.session_memory.clear()
 
-    def _format_history_for_prompt(self) -> str:
-        """组合历史会话与当前问题的 ReAct 轨迹，供模板 History 字段使用。"""
-        blocks: List[str] = []
-        if self.session_memory:
-            prev = "\n\n---\n\n".join(self.session_memory)
-            blocks.append("【此前多轮会话】\n" + prev)
-        if self.history:
-            blocks.append("【当前问题的工具轨迹】\n" + "\n".join(self.history))
-        if blocks:
-            return "\n\n".join(blocks)
-        return "（尚无历史；这是会话中的第一个问题。）"
-
-    def _append_session_turn(
-        self, question: str, final_answer: Optional[str], react_trace: List[str]
-    ) -> None:
-        """将本轮问答写入会话，供后续 query 使用。"""
-        parts = [f"【用户】\n{question.strip()}"]
-        if react_trace:
-            parts.append("【本问题内工具轨迹】\n" + "\n".join(react_trace))
-        if final_answer is not None:
-            parts.append(f"【助手最终答复】\n{final_answer.strip()}")
-        else:
-            parts.append("【助手最终答复】\n（本轮未完成、未以 Finish 结束或已达步数上限。）")
-        self.session_memory.append("\n".join(parts))
-
     def run(self, question: str) -> Optional[str]:
-        self.history = []
-        outcome: Optional[str] = None
-        current_step = 0
         self.last_run_trace = []
         cap_token = begin_trace_capture(self.last_run_trace)
+        outcome: Optional[str] = None
+        tools = self.tool_executor.to_openai_tools()
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": TOOL_AGENT_SYSTEM_PROMPT},
+            *list(self.session_memory),
+            {"role": "user", "content": question.strip()},
+        ]
+        turn_start = len(messages) - 1
 
         try:
+            current_step = 0
             while current_step < self.max_steps:
                 current_step += 1
                 trace_line(f"\n--- 第 {current_step} 步 ---")
 
-                tools_desc = self.tool_executor.getAvailableTools()
-                history_str = self._format_history_for_prompt()
-                prompt = REACT_PROMPT_TEMPLATE.format(
-                    tools=tools_desc, question=question, history=history_str
-                )
-
-                messages = [{"role": "user", "content": prompt}]
-                response_text = self.llm_client.think(messages=messages)
-                if not response_text:
+                result = self.llm_client.complete_with_tools(messages, tools)
+                if not result:
                     trace_line("错误：LLM未能返回有效响应。")
                     break
 
-                thought, action = self._parse_output(response_text)
-                if thought:
-                    trace_line(f"🤔 LLM输出：{thought}")
-                if not action:
-                    trace_line("警告：未能解析出有效的Action，流程终止。")
-                    break
+                assistant_msg: Dict[str, Any] = {"role": "assistant"}
+                if result.tool_calls:
+                    assistant_msg["tool_calls"] = result.tool_calls
+                    assistant_msg["content"] = (
+                        result.content if result.content is not None else ""
+                    )
+                else:
+                    assistant_msg["content"] = (
+                        result.content if result.content is not None else ""
+                    )
+                if result.reasoning_content:
+                    assistant_msg["reasoning_content"] = result.reasoning_content
 
-                if action.lstrip().lower().startswith("finish"):
-                    final_answer = self._parse_action_input(action)
-                    trace_line(f"🎉 最终答案: {final_answer}")
-                    outcome = final_answer
-                    return outcome
+                messages.append(assistant_msg)
 
-                tool_name, tool_input = self._parse_action(action)
-                if not tool_name:
-                    self.history.append("Observation: 无效的Action格式，请检查。")
-                    continue
+                if not result.tool_calls:
+                    outcome = assistant_msg.get("content") or ""
+                    trace_line(f"🎉 最终答案: {outcome}")
+                    return outcome or None
 
-                trace_line(f"🎬 行动: {tool_name}[{tool_input}]")
-                tool_function = self.tool_executor.getTool(tool_name)
-                observation = (
-                    tool_function(tool_input)
-                    if tool_function
-                    else f"错误：未找到名为 '{tool_name}' 的工具。"
-                )
-
-                trace_line(f"👀 观察: {observation}")
-                # 只写入规范化后的 Action，避免把模型多写的伪 Observation/第二 Action 带进 History
-                canonical = f"{tool_name}[{tool_input}]"
-                self.history.append(f"Action: {canonical}")
-                self.history.append(f"Observation: {observation}")
+                for tc in result.tool_calls:
+                    fn = tc.get("function") or {}
+                    name = fn.get("name") or ""
+                    args = fn.get("arguments") or "{}"
+                    preview = args if len(args) <= 200 else args[:200] + "…"
+                    trace_line(f"🛠 工具调用: {name}({preview})")
+                    observation = self.tool_executor.invoke(name, args)
+                    obs_preview = (
+                        observation
+                        if len(observation) <= 500
+                        else observation[:500] + "…"
+                    )
+                    trace_line(f"👀 工具结果: {obs_preview}")
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", ""),
+                            "content": observation,
+                        }
+                    )
 
             trace_line("已达到最大步数，流程终止。")
             return None
         finally:
             try:
-                self._append_session_turn(question, outcome, list(self.history))
+                self.session_memory.extend(messages[turn_start:])
             finally:
                 end_trace_capture(cap_token)
 
-    def _parse_output(self, text: str) -> Tuple[Optional[str], Optional[str]]:
+    def run_stream(self, question: str, web_model: Optional[str] = None):
         """
-        取 **最后一个** 行首的 `Action:` 之后的内容作为唯一动作（单行），避免模型
-        在正文中多次书写 Action/Observation 时误把整段吞进一个 action。
+        与 run() 相同对话逻辑，但通过 yield 产出 RayClaw 兼容的 SSE 事件 dict：
+        delta / reasoning / tool / error / done。
         """
-        raw = (text or "").strip("\n")
-        if not raw:
-            return None, None
+        self.last_run_trace = []
+        cap_token = begin_trace_capture(self.last_run_trace)
+        tools = self.tool_executor.to_openai_tools()
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": TOOL_AGENT_SYSTEM_PROMPT},
+            *list(self.session_memory),
+            {"role": "user", "content": question.strip()},
+        ]
+        turn_start = len(messages) - 1
+        saved_model: Optional[str] = None
+        if web_model and web_model.strip():
+            saved_model = self.llm_client.model
+            self.llm_client.model = web_model.strip()
+        try:
+            current_step = 0
+            while current_step < self.max_steps:
+                current_step += 1
+                trace_line(f"\n--- 第 {current_step} 步 ---")
 
-        line_matches = list(
-            re.finditer(r"(?mi)^\s*Action:\s*(.*)$", raw, flags=re.MULTILINE)
-        )
-        action_line: Optional[str] = None
-        cut = 0
-        if line_matches:
-            last_m = line_matches[-1]
-            action_line = (last_m.group(1) or "").strip()
-            cut = last_m.start()
-        else:
-            idx = raw.lower().rfind("action:")
-            if idx < 0:
-                return None, None
-            rest = raw[idx + len("action:") :].lstrip()
-            action_line = rest.split("\n", 1)[0].strip()
-            cut = idx
+                result = None
+                for ev in self.llm_client.stream_complete_with_tools(messages, tools):
+                    k = ev.get("kind")
+                    if k == "delta":
+                        yield {"type": "delta", "text": ev.get("text") or ""}
+                    elif k == "reasoning":
+                        yield {"type": "reasoning", "text": ev.get("text") or ""}
+                    elif k == "complete":
+                        result = ev.get("result")
 
-        prefix = raw[:cut].strip()
-        thought: Optional[str] = None
-        if prefix:
-            thought = re.sub(
-                r"(?is)^\s*Thought:\s*",
-                "",
-                prefix,
-                count=1,
-            ).strip()
-            if not thought:
-                thought = prefix
+                if result is None:
+                    trace_line("错误：LLM未能返回有效响应。")
+                    yield {"type": "error", "message": "LLM 调用失败或返回无效"}
+                    yield {"type": "done"}
+                    return
 
-        if not action_line:
-            return thought, None
-        return thought, action_line
+                assistant_msg: Dict[str, Any] = {"role": "assistant"}
+                if result.tool_calls:
+                    assistant_msg["tool_calls"] = result.tool_calls
+                    assistant_msg["content"] = (
+                        result.content if result.content is not None else ""
+                    )
+                else:
+                    assistant_msg["content"] = (
+                        result.content if result.content is not None else ""
+                    )
+                if result.reasoning_content:
+                    assistant_msg["reasoning_content"] = result.reasoning_content
 
-    def _parse_action(self, action_text: str) -> Tuple[Optional[str], Optional[str]]:
-        return _parse_tool_call_line(action_text)
+                messages.append(assistant_msg)
 
-    def _parse_action_input(self, action_text: str) -> str:
-        _, inner = _parse_tool_call_line(action_text)
-        return inner if inner is not None else ""
+                if not result.tool_calls:
+                    yield {"type": "done"}
+                    return
+
+                for tc in result.tool_calls:
+                    fn = tc.get("function") or {}
+                    name = fn.get("name") or ""
+                    args = fn.get("arguments") or "{}"
+                    preview = args
+                    if len(preview) > TOOL_PREVIEW_MAX:
+                        preview = preview[:TOOL_PREVIEW_MAX] + "…"
+                    trace_line(f"🛠 工具调用: {name}({args[:200]}{'…' if len(args) > 200 else ''})")
+                    observation = self.tool_executor.invoke(name, args)
+                    obs_preview = (
+                        observation
+                        if len(observation) <= TOOL_PREVIEW_MAX
+                        else observation[:TOOL_PREVIEW_MAX] + "…"
+                    )
+                    trace_line(f"👀 工具结果: {obs_preview}")
+                    yield {"type": "tool", "tool_name": name, "preview": obs_preview}
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.get("id", ""),
+                            "content": observation,
+                        }
+                    )
+
+            trace_line("已达到最大步数，流程终止。")
+            yield {"type": "done"}
+        finally:
+            if saved_model is not None:
+                self.llm_client.model = saved_model
+            try:
+                self.session_memory.extend(messages[turn_start:])
+            finally:
+                end_trace_capture(cap_token)
 
 
 def build_agent(use_reasoner: bool = False) -> ReActAgent:
     llm = HelloAgentsLLM(use_reasoner=use_reasoner)
     tool_executor = ToolExecutor()
     search_desc = "一个网页搜索引擎。当你需要回答关于时事、事实以及在你的知识库中找不到的信息时，应使用此工具。"
-    tool_executor.registerTool("Search", search_desc, search)
+    tool_executor.registerTool(
+        "Search",
+        search_desc,
+        {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "搜索引擎用的检索词或问题短语。",
+                },
+            },
+            "required": ["query"],
+        },
+        lambda args: search(args.get("query", "")),
+    )
     time_desc = (
         "从操作系统读取当前真实的本地日期与时间（含星期）。涉及「最新」「今年」「当前」等时效问题时，"
-        "应先调用本工具确认日期，再构造 Search 的检索词；参数可留空，例如 GetCurrentTime[]。"
+        "应先调用本工具确认日期，再构造 Search 的检索词。"
     )
-    tool_executor.registerTool("GetCurrentTime", time_desc, get_current_time)
+    tool_executor.registerTool(
+        "GetCurrentTime",
+        time_desc,
+        {"type": "object", "properties": {}},
+        lambda _args: get_current_time(),
+    )
     return ReActAgent(
         llm_client=llm,
         tool_executor=tool_executor,
@@ -231,7 +255,6 @@ def _print_help() -> None:
 
 
 def _prompt_model_choice() -> bool:
-    """交互选择是否使用思考模型。返回 True 表示 reasoner。"""
     chat_id, reasoner_id = get_default_model_ids()
     default = os.getenv("LLM_DEFAULT_PROFILE", "chat").strip().lower()
     default_is_reasoner = default in ("reasoner", "think", "thinking", "r1")
@@ -259,9 +282,6 @@ def _prompt_model_choice() -> bool:
 
 
 def _handle_model_command(agent: ReActAgent, text: str) -> bool:
-    """
-    处理 /model 命令。返回 True 表示已处理（应跳过后续 agent.run）。
-    """
     parts = text.split(maxsplit=1)
     llm = agent.llm_client
     if len(parts) == 1:
@@ -275,7 +295,7 @@ def _handle_model_command(agent: ReActAgent, text: str) -> bool:
         agent.max_steps = _agent_max_steps_for_llm(llm)
         print(
             f"已切换为 {llm.get_model_profile()}  （{llm.model}）"
-            f"  · ReAct 最大步数: {agent.max_steps}"
+            f"  · 工具调用最大步数: {agent.max_steps}"
         )
     except ValueError as e:
         print(str(e))
@@ -283,7 +303,6 @@ def _handle_model_command(agent: ReActAgent, text: str) -> bool:
 
 
 def _read_user_message() -> Optional[str]:
-    """读取一条用户消息。EOF（Ctrl+Z+回车 / Ctrl+D）返回 None 表示结束会话。"""
     try:
         first = input("› ").rstrip("\n")
     except EOFError:
@@ -322,7 +341,7 @@ def run_interactive_cli(use_reasoner: Optional[bool] = None) -> None:
             pass
 
     print(
-        "ReAct 智能体 — 交互模式\n"
+        "工具调用智能体（OpenAI tools）— 交互模式\n"
         "在 › 后输入问题并回车；长文本可先输入 /multi，结束时单独一行输入 END。\n"
         "命令：/help  /model  /clear  /exit\n"
     )
@@ -372,8 +391,8 @@ def run_interactive_cli(use_reasoner: Optional[bool] = None) -> None:
         print("\n" + "─" * 48 + "\n")
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="ReAct 智能体（交互式 CLI）")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="工具调用智能体（交互式 CLI）")
     g = parser.add_mutually_exclusive_group()
     g.add_argument(
         "--chat",
